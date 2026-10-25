@@ -1,13 +1,7 @@
-import functools
-import hmac
-import inspect
-import json
 import logging
-import os
-import time
 
-import anyio
 from mcp.server.fastmcp import FastMCP
+from mcp_server_kit import offload_sync_tools, serve
 
 from loki_tail_mcp.config import MCP_BEARER_TOKEN, PORT
 from loki_tail_mcp.loki_client import (
@@ -18,8 +12,6 @@ from loki_tail_mcp.loki_client import (
     parse_time,
 )
 from loki_tail_mcp.resolve import filter_ephemeral, resolve_container
-
-logger = logging.getLogger(__name__)
 
 INSTRUCTIONS = (
     "Loki log search across the container fleet. "
@@ -46,114 +38,8 @@ mcp = FastMCP(
     stateless_http=True,
     json_response=True,
 )
+offload_sync_tools(mcp, logger_name="loki_tail_mcp.requests")
 loki = LokiClient()
-
-
-# --- Run blocking tool handlers off the event loop -----------------------
-# The MCP SDK runs a synchronous @mcp.tool function INLINE on the single
-# asyncio event loop (func_metadata: the sync branch is just `return fn(...)`).
-# Every tool here makes a blocking httpx call to Loki, so one slow query would
-# freeze the loop and stall ALL other requests until it returns (the client's
-# 4-minute "MCP server unresponsive" timeout). Wrapping mcp.tool runs each
-# sync tool in a worker thread via anyio.to_thread.run_sync, keeping the loop
-# free. functools.wraps + __signature__ keep the tool schema unchanged (no
-# client restart); we register the wrapper but return the original sync fn so
-# the module name stays directly callable. httpx.Client is thread-safe, so the
-# shared LokiClient needs no lock. See feedback_mcp_sync_tool_event_loop.
-req_logger = logging.getLogger("loki_tail_mcp.requests")
-if not req_logger.handlers:
-    _h = logging.StreamHandler()
-    _h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-    req_logger.addHandler(_h)
-    req_logger.setLevel(logging.INFO)
-    req_logger.propagate = False
-
-
-def _rss_mib() -> int:
-    """Current process RSS in MiB, read cheaply from /proc (no psutil dep) —
-    lets Grafana correlate a hang/OOM with the request that triggered it."""
-    try:
-        with open("/proc/self/statm") as f:
-            pages = int(f.read().split()[1])
-        return pages * (os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf")
-                        else 4096) // (1024 * 1024)
-    except Exception:
-        return -1
-
-
-_orig_tool = mcp.tool
-
-
-def _threaded_tool(*d_args, **d_kwargs):
-    register = _orig_tool(*d_args, **d_kwargs)
-
-    def decorator(fn):
-        if inspect.iscoroutinefunction(fn):
-            return register(fn)
-
-        @functools.wraps(fn)
-        async def wrapper(*args, **kwargs):
-            start = time.perf_counter()
-            outcome = "ok"
-            try:
-                return await anyio.to_thread.run_sync(
-                    functools.partial(fn, *args, **kwargs)
-                )
-            except Exception:
-                outcome = "error"
-                raise
-            finally:
-                req_logger.info(
-                    "tool=%s outcome=%s duration_ms=%d rss_mib=%d",
-                    fn.__name__, outcome,
-                    int((time.perf_counter() - start) * 1000),
-                    _rss_mib(),
-                )
-
-        wrapper.__signature__ = inspect.signature(fn)
-        register(wrapper)
-        return fn
-
-    return decorator
-
-
-mcp.tool = _threaded_tool
-
-
-class BearerAuthMiddleware:
-    """Pure ASGI middleware compatible with SSE streaming."""
-
-    def __init__(self, app, expected_token: str):
-        self.app = app
-        self.expected_token = expected_token
-
-    async def __call__(self, scope, receive, send):
-        if scope["type"] in ("http", "websocket"):
-            path = scope.get("path", "")
-            if path.startswith("/.well-known/"):
-                return await self.app(scope, receive, send)
-            headers = dict(scope.get("headers", []))
-            auth = headers.get(b"authorization", b"").decode()
-            if auth.startswith("Bearer "):
-                token = auth[7:]
-                if hmac.compare_digest(token, self.expected_token):
-                    return await self.app(scope, receive, send)
-            client_host = scope.get("client", ("unknown",))[0]
-            logger.warning("Rejected request: invalid bearer from %s", client_host)
-            body = json.dumps({"error": "unauthorized"}).encode()
-            await send(
-                {
-                    "type": "http.response.start",
-                    "status": 401,
-                    "headers": [
-                        [b"content-type", b"application/json"],
-                        [b"content-length", str(len(body)).encode()],
-                    ],
-                }
-            )
-            await send({"type": "http.response.body", "body": body})
-            return
-        await self.app(scope, receive, send)
 
 
 # ---------------------------------------------------------------------------
@@ -468,32 +354,12 @@ def loki_list_containers(lookback: str = "1h") -> str:
 
 
 def main():
-    import sys
-
     # Emit our per-request tool logs at INFO so they reach journald → Loki.
     # basicConfig writes to stderr, so this is safe for the stdio transport
     # too (stdout must stay pure JSON-RPC).
     logging.basicConfig(level=logging.INFO)
 
-    if "--stdio" in sys.argv:
-        # Local single-client mode: the MCP client spawns this process and
-        # owns it — no network surface, so no bearer token or uvicorn.
-        mcp.run(transport="stdio")
-        return
-
-    import uvicorn
-
-    # Streamable HTTP at /mcp, stateless: every tool call is an independent
-    # POST, so dropped connections and container restarts never strand a
-    # client session. (Legacy SSE was removed 2026-06 once all clients
-    # migrated.)
-    if not MCP_BEARER_TOKEN:
-        raise SystemExit(
-            "MCP_BEARER_TOKEN is not set. Refusing to start an unauthenticated "
-            "MCP server. Set it in .secrets.env and restart."
-        )
-    app = BearerAuthMiddleware(mcp.streamable_http_app(), expected_token=MCP_BEARER_TOKEN)
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+    serve(mcp, port=PORT, bearer_token=MCP_BEARER_TOKEN)
 
 
 if __name__ == "__main__":
