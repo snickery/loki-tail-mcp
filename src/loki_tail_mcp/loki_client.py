@@ -207,6 +207,11 @@ def format_streams(result: dict[str, Any], include_labels: list[str] | None = No
 
     if result_type == "matrix":
         return _format_matrix(streams)
+    if result_type == "vector":
+        return _format_vector(streams)
+    if result_type == "scalar":
+        # Loki returns a bare [ts, "value"] pair for scalar results.
+        return f"{{}} {streams[0]}:{streams[1]}" if streams else "(no results)"
 
     if not streams:
         return "(no results)"
@@ -228,8 +233,26 @@ def format_streams(result: dict[str, Any], include_labels: list[str] | None = No
             prefix = f"{ts}  [{label_str}]  " if label_str else f"{ts}  "
             rows.append((ts_ns, prefix + line.rstrip()))
 
+    if not rows:
+        return "(no results)"
     rows.sort(key=lambda r: r[0], reverse=True)
     return "\n".join(r[1] for r in rows)
+
+
+def _label_str(series: dict[str, Any]) -> str:
+    labels = series.get("metric") or series.get("stream") or {}
+    return ",".join(f"{k}={v}" for k, v in sorted(labels.items()))
+
+
+def _format_vector(series: list[dict[str, Any]]) -> str:
+    """Instant metric query: one `[ts, "value"]` sample per series."""
+    if not series:
+        return "(no results)"
+    out = []
+    for s in series:
+        ts, v = s.get("value", [None, None])
+        out.append(f"{{{_label_str(s)}}} {ts}:{v}")
+    return "\n".join(out)
 
 
 def _format_matrix(series: list[dict[str, Any]]) -> str:
@@ -237,9 +260,6 @@ def _format_matrix(series: list[dict[str, Any]]) -> str:
         return "(no results)"
     out = []
     for s in series:
-        labels = s.get("metric") or s.get("stream") or {}
-        label_str = ",".join(f"{k}={v}" for k, v in sorted(labels.items()))
-        values = s.get("values", [])
-        samples = " ".join(f"{ts}:{v}" for ts, v in values)
-        out.append(f"{{{label_str}}} {samples}")
+        samples = " ".join(f"{ts}:{v}" for ts, v in s.get("values", []))
+        out.append(f"{{{_label_str(s)}}} {samples}")
     return "\n".join(out)

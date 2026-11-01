@@ -92,3 +92,52 @@ def test_format_matrix_response():
     assert "container=traefik" in out
     assert "1735689600:0.5" in out
     assert "1735689660:0.75" in out
+
+
+# Metric query result types. Shapes captured from Loki 2026-11-02.
+# Regression: instant metric queries (resultType "vector") rendered as "" —
+# a false zero for count_over_time and friends.
+
+
+def test_format_vector_instant_metric():
+    resp = {
+        "status": "success",
+        "data": {
+            "resultType": "vector",
+            "result": [{"metric": {}, "value": [1793540905.905, "66848"]}],
+        },
+    }
+    assert format_streams(resp) == "{} 1793540905.905:66848"
+
+
+def test_format_vector_multiple_series_with_labels():
+    resp = {
+        "status": "success",
+        "data": {
+            "resultType": "vector",
+            "result": [
+                {"metric": {"container": "loki"}, "value": [1793540905, "12"]},
+                {"metric": {"container": "alloy", "host": "node-a"}, "value": [1793540905, "0"]},
+            ],
+        },
+    }
+    lines = format_streams(resp).splitlines()
+    assert lines == [
+        "{container=loki} 1793540905:12",
+        "{container=alloy,host=node-a} 1793540905:0",
+    ]
+
+
+def test_format_vector_empty_is_explicit():
+    resp = {"status": "success", "data": {"resultType": "vector", "result": []}}
+    assert format_streams(resp) == "(no results)"
+
+
+def test_format_scalar():
+    resp = {"status": "success", "data": {"resultType": "scalar", "result": [1793540905, "3"]}}
+    assert format_streams(resp) == "{} 1793540905:3"
+
+
+def test_format_streams_without_values_is_explicit_not_blank():
+    # Never return "" — callers can't tell a blank from a formatting bug.
+    assert format_streams(_streams_response([{"stream": {"container": "a"}}])) == "(no results)"
